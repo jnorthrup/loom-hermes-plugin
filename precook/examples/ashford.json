@@ -1,0 +1,22 @@
+{
+  "format": "loom-script/1",
+  "system": "You are a careful archivist. Answer in one short sentence.",
+  "goal": "Summarise the history of the lighthouse keepers of Ashford Point.",
+  "loops": ["epoch", "chapter", "bullet"],
+  "request": {"max_tokens": 24, "temperature": 0},
+  "outline": [
+    {"label": "e1", "text": "Epoch 1: the oil-lamp years, 1820-1880. Keepers were appointed by the harbour board.",
+     "children": [
+      {"label": "ch1", "text": "Chapter 1: the first keeper, Elias Marr, and the storm of 1831.",
+       "children": [
+        {"label": "b1", "text": "Bullet: the lamp failed for two nights.", "task": "What failed, and for how long?"},
+        {"label": "b2", "text": "Bullet: Marr rowed out to the wreck of the Heron.", "task": "What did Marr do?"}
+      ]},
+      {"label": "ch2", "text": "Chapter 2: the Hale sisters keep the light, 1850-1880.",
+       "children": [
+        {"label": "b1", "text": "Bullet: they logged every passing ship.", "task": "What did the sisters record?"}
+      ]}
+    ]},
+    {"label": "e2", "text": "Epoch 2: electrification, 1880-1930.", "task": "When did electrification happen?"}
+  ]
+}

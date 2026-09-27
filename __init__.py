@@ -30,14 +30,14 @@ from typing import Any, Dict, List, Optional
 from agent.context_compressor import ContextCompressor
 from agent.context_engine import ContextEngine  # noqa: F401  (discovery scans the file head for this name)
 
+from .loomframes import render_frames
+
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "loom"
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MAX_TEXT = 4000
 _MAX_DEPTH = 64
-FRAMES_OPEN = "[loom: nested work frames, outermost first; the last frame is the current loop]"
-FRAMES_CLOSE = "[/loom]"
 
 _ACTIVE: Optional["LoomEngine"] = None  # engine of the most recently started session, for /loom
 
@@ -91,13 +91,7 @@ class LoomStack:
         return f"{depth + 1}" + (f" {label}" if label else "")
 
     def render(self, goal_block: str) -> str:
-        parts = [FRAMES_OPEN]
-        if goal_block:
-            parts.append("== goal ==\n" + goal_block)
-        for depth, frame in enumerate(self.frames):
-            parts.append(f"== {self._name(depth)} ==\n{frame['text']}")
-        parts.append(FRAMES_CLOSE)
-        return "\n".join(parts)
+        return render_frames(self.frames, goal_block)
 
     def outline(self) -> str:
         if not self.frames:
