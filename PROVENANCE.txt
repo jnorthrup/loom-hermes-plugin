@@ -1,0 +1,34 @@
+Provenance
+==========
+
+Origin
+  Written in the koboldcpp-loom repository, then moved here as its own repository.
+    repository  github.com/jnorthrup/koboldcpp-loom (private)
+    branch      loom-tier-cache
+    path        hermes-plugin/loom
+    commits     1eaa89cc2102bca027015147b6aa3453520cedf7  first version (plan tree)
+                9c66f41e602d8423eae19c9d94adf21dd1dab7c8  nesting stack (current design)
+  Each commit in this repository names the source commit it was copied from, with the
+  original author date. Files were copied byte for byte; no history was rewritten upstream.
+
+Authorship
+  Designed by James R. Northrup (jnorthrup). Code written by the Hermes Agent (Anthropic
+  Claude model) working in his session, at his direction, 2026-09-27.
+
+Host it plugs into
+  Hermes Agent context-engine plugin API (agent/context_engine.py ContextEngine,
+  select_context hook; plugins/context_engine discovery), built and tested against
+    Hermes Agent v0.21.5+2367.g5dcfd72, upstream commit
+    5dcfd72a968e17cc4dc262c46d918a6841a21722 (2026-09-25).
+  It subclasses Hermes' built-in ContextCompressor, so compaction is Hermes' own code.
+
+Server it is tuned for
+  koboldcpp --loomcache (prefix-tree branch cache), github.com/jnorthrup/koboldcpp-loom
+  branch loom-tier-cache, commit 087d82ba2. Any server with prefix reuse also works; the
+  plugin sends ordinary OpenAI-style chat requests with no cache fields.
+
+Design rules it follows (from the author)
+  - Nesting, not an up-front plan: frames are pushed on entering a level and popped on
+    leaving it, like nested for loops.
+  - Frames are independent obstack frames; nothing interlocks.
+  - No cache hints, tiers or fixed depth are sent; the server finds reuse from tokens.

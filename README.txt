@@ -17,10 +17,13 @@ What it does
   Compaction is the built-in compressor, unchanged; it rewrites conversation turns only.
 
 Install
-  ln -sfn "$PWD/hermes-plugin/loom" ~/.hermes/plugins/loom
+  git clone git@github.com:jnorthrup/loom-hermes-plugin.git
+  ln -sfn "$PWD/loom-hermes-plugin" ~/.hermes/plugins/loom
   # config.yaml
   context:
     engine: loom
+
+  The link must be named `loom`: Hermes selects the engine by directory name.
 
 Use
   The model gets one tool, `loom`:

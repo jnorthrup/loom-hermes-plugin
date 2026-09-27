@@ -15,6 +15,8 @@ Compaction is inherited unchanged from the built-in compressor; it only rewrites
 turns, never the frames.
 
 Enable with ``context.engine: loom`` in config.yaml.
+
+Provenance: see PROVENANCE.txt (origin jnorthrup/koboldcpp-loom@9c66f41e6, path hermes-plugin/loom).
 """
 
 from __future__ import annotations
