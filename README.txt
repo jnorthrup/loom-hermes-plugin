@@ -67,5 +67,5 @@ Precook (precook/, stdlib only, runs without Hermes)
 TODO
   - Hermes-driven precook: let the context engine push/pop frames from a loom script
     so a live /goal session follows the outline instead of the model's own pushes.
-  - Stored state (the persistence continuum): see koboldcpp-loom README-loom.txt and
-    runpod experiments/loom/docs/looms-hosting-proposal.md.
+  - Stored state: text only (recipes, run artifacts); KV/state snapshots ruled out as
+    GB-scale. See koboldcpp-loom README-loom.txt.
