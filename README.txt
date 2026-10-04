@@ -30,15 +30,75 @@ Use
     push {text, label?}   enter a level: its stable instructions, not findings
     pop  {count?}         leave one or more levels
     show                  print the frames
-  /loom in the session prints the stack.
+  /loom explains how to use the agent-bound show tool. Hermes slash handlers receive
+  only raw arguments; they cannot safely identify a session and never display frames.
 
-State
-  $HERMES_HOME/loom/<session_id>.json. A delegated subagent starts inside its parent's
-  frames, like an inner loop.
+State and host compatibility
+  Requires the paired Hermes ContextSelectionRejected, validate_request and
+  inherit_from_parent hooks. Older hosts without typed refusal are unsupported.
+  No host or gateway is installed/restarted by these source changes.
+
+  $HERMES_HOME/loom/session-<sha256 of exact session ID>.json carries the exact
+  session and resolved profile home. Files are bounded, validated, written privately
+  through unique temporary files, fsynced and atomically replaced. A successful
+  reset writes an empty stack, so restart cannot restore cleared frames. A failed
+  load or write refuses requests until repaired or explicitly reset; required frames
+  are never silently truncated. Separate sessions/profiles have separate engine state.
+  One active writer per session remains required; atomic replacement is not a
+  cross-process compare-and-swap ledger.
+
+  Legacy sanitized filenames do not identify their owner and can collide. They are
+  preserved, never auto-imported. An operator can explicitly reset the affected
+  session, or review its original ownership and re-enter frames through the tool.
+
+  Delegation uses a host call after child session initialization to copy only frames
+  from an explicitly supplied parent in the same resolved profile. Child edits do
+  not change the parent. Unknown or cross-profile inheritance refuses. Compression
+  rotation carries frames only with an explicit matching parent/session boundary.
+  Goals are read strictly in the engine's bound profile, even on a differently scoped
+  thread. A missing goal is empty; unavailable storage or malformed persisted goal
+  content refuses. This requires the paired Hermes load_goal(strict=True) seam.
+
+Context budget
+  Required frames are appended without changing persisted history. The paired host
+  validates the FINAL built request after provider cap/schema overrides and middleware,
+  and again at the execution-middleware terminal callback before its main provider
+  dispatch. Observation callbacks receive isolated copies. Rejection preserves accepted input, does not
+  retry/fallback, and never trims instructions. Earlier auxiliary compression calls
+  may already have happened. Incidental final-validator errors also refuse.
+
+  Budget enforcement currently supports text chat-completions with an explicit output
+  cap and a reviewed model/template contract in context.loom. No contract is enabled
+  by default. Native Responses/Anthropic wire formats, image/audio content and opaque
+  extra_body overrides and managed Relay execution refuse when frames or a goal are required.
+
+  The contract is an OPERATOR ASSERTION, not tokenizer detection: verify the deployed
+  model uses a byte-fallback tokenizer (at most one ordinary token per UTF-8 byte),
+  and bound its template/framing costs beyond serialized request bytes. Unknown models
+  or templates must remain disabled. Pin the endpoint/model operationally; matching
+  a model name alone does not prove what a remote server actually loaded.
+
+    context:
+      engine: loom
+      loom:
+        model: <exact reviewed model name>
+        tokenizer: utf8-byte-fallback
+        prompt_overhead: <reviewed framing token upper bound>
+        message_overhead: <reviewed extra tokens per message, including tool calls>
+        tool_overhead: <reviewed extra tokens per tool schema>
+
+  Charge = serialized messages/tools UTF-8 bytes + the declared framing bounds +
+  actual wire output cap. This conservative bound may reject requests that an exact
+  tokenizer would fit. It is not a universal or provider-exact token estimate.
+  Review a contract before activation; do not copy the synthetic test bounds into
+  production. If the selected model differs or no defensible bound exists, it refuses.
 
 Precook (precook/, stdlib only, runs without Hermes)
   A loom script (precook/examples/ashford.json) is the book outline of a context
-  evolution: goal, then any depth of labelled frames, leaves carry the task.
+  evolution: goal, then up to 64 labelled frames, leaves carry the task.
+  Both precook variants use the shared strict frame bounds: 4000 characters per
+  frame and the same label syntax. They are standalone generators, not Hermes
+  engines; they do not claim the engine persistence or final request budget guard.
 
   loom-loop-precook   precook/loom_loop.py
     emit SCRIPT -o book.py     the outline as literal nested `for` loops, one loop
@@ -62,10 +122,16 @@ Precook (precook/, stdlib only, runs without Hermes)
   Server mate: koboldcpp-loom --loomdir DIR serves /v1/looms, which stores the same
   scripts, runs the same walk through its own /v1/chat/completions, and keeps run
   artifacts for replay. loomframes.py here and the copy in koboldcpp-loom's
-  loomstore.py must stay byte-identical (format loom-frames/1).
+  loomstore.py must render the same bytes for valid frames (format loom-frames/1).
+  Validation helpers may differ; the frame rendering format has not changed.
 
 TODO
   - Hermes-driven precook: let the context engine push/pop frames from a loom script
     so a live /goal session follows the outline instead of the model's own pushes.
   - Stored state: text only (recipes, run artifacts); KV/state snapshots ruled out as
     GB-scale. See koboldcpp-loom README-loom.txt.
+
+Local verification
+  Use the paired Hermes test interpreter and runner, with no runtime activation:
+    HERMES_PYTHON=/path/to/hermes-agent/.venv/bin/python /path/to/hermes-agent/scripts/run_tests.sh /path/to/loom-hermes-plugin/tests --import-mode=importlib
+  Tests use disposable profile homes and deny socket connections.

@@ -25,22 +25,19 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor import ContextCompressor
-from agent.context_engine import ContextEngine  # noqa: F401  (discovery scans the file head for this name)
+from agent.context_engine import ContextSelectionRejected, ContextEngine  # noqa: F401  (discovery scans the file head for this name)
 
-from .loomframes import render_frames
+from .loomframes import MAX_DEPTH, render_frames, validate_frame, validate_frames
+from . import loomstate
 
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "loom"
-_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_MAX_TEXT = 4000
-_MAX_DEPTH = 64
-
-_ACTIVE: Optional["LoomEngine"] = None  # engine of the most recently started session, for /loom
-
 
 def _clean_text(text: Any) -> str:
     return str(text or "").replace("\r\n", "\n").strip()
@@ -58,28 +55,19 @@ class LoomStack:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LoomStack":
         stack = cls()
-        for frame in (data.get("frames") or [])[:_MAX_DEPTH]:
-            text = _clean_text(frame.get("text")) if isinstance(frame, dict) else ""
-            label = str(frame.get("label") or "") if isinstance(frame, dict) else ""
-            if text:
-                stack.frames.append({"label": label if _LABEL_RE.match(label) else "", "text": text})
+        if not isinstance(data, dict) or set(data) != {"frames"}:
+            raise ValueError("stack must contain only frames")
+        stack.frames = validate_frames(data["frames"])
         return stack
 
     def push(self, text: Any, label: Any = "") -> None:
-        text = _clean_text(text)
-        label = str(label or "").strip()
-        if not text:
-            raise ValueError("push needs text")
-        if len(text) > _MAX_TEXT:
-            raise ValueError(f"frame is {len(text)} chars; limit {_MAX_TEXT}. Push a nested frame instead.")
-        if label and not _LABEL_RE.match(label):
-            raise ValueError(f"bad label {label!r}: use 1-64 chars of letters, digits, '_', '.', '-'")
-        if len(self.frames) >= _MAX_DEPTH:
-            raise ValueError(f"nesting is {_MAX_DEPTH} deep; pop before pushing")
-        self.frames.append({"label": label, "text": text})
+        frame = validate_frame({"text": text, "label": "" if label is None else label})
+        if len(self.frames) >= MAX_DEPTH:
+            raise ValueError(f"nesting is {MAX_DEPTH} deep; pop before pushing")
+        self.frames.append(frame)
 
     def pop(self, count: int = 1) -> int:
-        if count < 1:
+        if type(count) is not int or count < 1:
             raise ValueError("pop count must be at least 1")
         if count > len(self.frames):
             raise ValueError(f"only {len(self.frames)} frame(s) to pop")
@@ -105,17 +93,21 @@ class LoomStack:
         return "\n".join(lines)
 
 
-def _goal_block(session_id: str) -> str:
+def _goal_block(session_id: str, home: str) -> str:
     """Goal text plus subgoals. Status is left out on purpose: it changes every turn and would
     move every frame behind it."""
     if not session_id:
         return ""
     try:
         from hermes_cli.goals import load_goal
-        state = load_goal(session_id)
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        token = set_hermes_home_override(home)
+        try:
+            state = load_goal(session_id, strict=True)
+        finally:
+            reset_hermes_home_override(token)
     except Exception as exc:
-        logger.debug("loom: load_goal failed: %s", exc)
-        return ""
+        raise ContextSelectionRejected("loom: required goal state could not be read safely; request was not sent.") from exc
     if state is None or state.status == "cleared" or not (state.goal or "").strip():
         return ""
     block = _clean_text(state.goal)
@@ -128,7 +120,9 @@ def _append_to_content(content: Any, text: str) -> Any:
         return f"{content}\n\n{text}" if content else text
     if isinstance(content, list):
         return list(content) + [{"type": "text", "text": text}]
-    return text if content is None else content
+    if content is None:
+        return text
+    raise ContextSelectionRejected("loom: unsupported system content; required frames were not sent.")
 
 
 def _compression_kwargs() -> Dict[str, Any]:
@@ -178,6 +172,13 @@ class LoomEngine(ContextCompressor):
     """ContextCompressor plus a front-of-context /goal frame stack."""
 
     def __init__(self, model: str = "", **kwargs: Any) -> None:
+        self._loom_budget = kwargs.pop("loom_budget", None)
+        if self._loom_budget is None:
+            try:
+                from hermes_cli.config import load_config_readonly
+                self._loom_budget = (load_config_readonly().get("context") or {}).get("loom")
+            except Exception:
+                self._loom_budget = None
         settings = _compression_kwargs()
         settings.update(kwargs)
         settings.setdefault("quiet_mode", True)
@@ -185,67 +186,166 @@ class LoomEngine(ContextCompressor):
         self.stack = LoomStack()
         self._loom_session = ""
         self._loom_home = ""
+        self._loom_error = ""
+        self._loom_lock = RLock()
+        self._loom_init_kwargs = dict(kwargs, loom_budget=self._loom_budget)
 
     @property
     def name(self) -> str:
         return "loom"
 
+    def clone_for_agent(self):
+        # Clone configuration only. Session DBs, locks and frames never enter a new agent implicitly.
+        return type(self)(model=self.model, **self._loom_init_kwargs)
+
     # -- state -------------------------------------------------------------------------------
     def _state_path(self) -> str:
         if not (self._loom_home and self._loom_session):
             return ""
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", self._loom_session)
-        return os.path.join(self._loom_home, "loom", f"{safe}.json")
+        return str(loomstate.state_path(self._loom_home, self._loom_session))
 
-    def _save(self) -> None:
-        path = self._state_path()
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.stack.to_dict(), f, ensure_ascii=True, indent=1)
-        os.replace(tmp, path)
+    def _require_ready(self):
+        if self._loom_error or not self._state_path():
+            raise ContextSelectionRejected(self._loom_error or "loom: session identity is unavailable.")
+
+    def _save(self, stack=None) -> None:
+        self._require_ready()
+        loomstate.save(Path(self._state_path()), self._loom_home, self._loom_session,
+                       (self.stack if stack is None else stack).frames)
+
+    def _commit(self, stack):
+        try:
+            self._save(stack)
+        except Exception as exc:
+            self._loom_error = "loom: frame persistence failed; reload the session before continuing."
+            raise ContextSelectionRejected(self._loom_error) from exc
+        self.stack = stack
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        global _ACTIVE
-        parent = getattr(super(), "on_session_start", None)
-        if callable(parent):
-            parent(session_id, **kwargs)
-        self._loom_session = session_id or ""
-        home = kwargs.get("hermes_home")
-        if not home:
+        with self._loom_lock:
+            old_home, old_session = self._loom_home, self._loom_session
+            old_frames = self.stack.to_dict()
+            old_error = self._loom_error
+            # Clear first: even a failed load cannot expose the previous session.
+            self.stack = LoomStack()
+            self._loom_session = session_id if isinstance(session_id, str) else ""
+            self._loom_home = ""
+            self._loom_error = ""
             try:
-                from hermes_constants import get_hermes_home
-                home = str(get_hermes_home())
+                home = kwargs.get("hermes_home") or (old_home if kwargs.get("boundary_reason") == "compression" else None)
+                if not home:
+                    from hermes_constants import get_hermes_home
+                    home = str(get_hermes_home())
+                self._loom_home = str(Path(home).expanduser().resolve())
+                if not self._loom_session or len(self._loom_session) > 4096:
+                    raise ValueError("session identity is unavailable")
+                super().on_session_start(session_id, **kwargs)
+                path = Path(self._state_path())
+                if kwargs.get("boundary_reason") == "compression" and (
+                    old_error or old_home != self._loom_home or kwargs.get("old_session_id") != old_session
+                ):
+                    raise ValueError("unbound compression lineage")
+                frames = loomstate.load(path, self._loom_home, self._loom_session)
+                if frames is not None:
+                    self.stack = LoomStack.from_dict({"frames": frames})
+                elif kwargs.get("boundary_reason") == "compression":
+                    self._commit(LoomStack.from_dict(old_frames))
+                else:
+                    # Old sanitized filenames have no identity and can collide. Never guess ownership.
+                    legacy = path.parent / (re.sub(r"[^A-Za-z0-9_.-]", "_", self._loom_session) + ".json")
+                    if os.path.lexists(legacy):
+                        raise ValueError("legacy state requires explicit migration")
             except Exception:
-                home = ""
-        self._loom_home = home or ""
-        path = self._state_path()
-        # A saved stack for this session wins; otherwise keep what we hold (a delegated child
-        # starts inside its parent's frames, like an inner loop).
-        if path and os.path.exists(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    self.stack = LoomStack.from_dict(json.load(f))
-            except Exception as exc:
-                logger.warning("loom: could not read %s: %s", path, exc)
-        _ACTIVE = self
+                self.stack = LoomStack()
+                self._loom_error = "loom: saved frames could not be safely loaded; repair or explicitly reset this session."
 
     def on_session_reset(self) -> None:
-        super().on_session_reset()
-        self.stack = LoomStack()
+        with self._loom_lock:
+            # Explicit reset may recover malformed state, but only an established identity.
+            self._loom_error = ""
+            self._commit(LoomStack())
+            super().on_session_reset()
+
+    def inherit_from_parent(self, parent: ContextEngine) -> None:
+        if not isinstance(parent, type(self)):
+            raise ContextSelectionRejected("loom: parent engine does not support explicit frame inheritance.")
+        # Snapshot the parent before locking the child; no lock ordering cycle.
+        with parent._loom_lock:
+            parent._require_ready()
+            home, session, data = parent._loom_home, parent._loom_session, parent.stack.to_dict()
+        with self._loom_lock:
+            self._require_ready()
+            if home != self._loom_home or session == self._loom_session:
+                raise ContextSelectionRejected("loom: frame inheritance requires distinct sessions in the same profile.")
+            if self.stack.frames:
+                raise ContextSelectionRejected("loom: refusing to replace an initialized child frame stack.")
+            self._commit(LoomStack.from_dict(data))
 
     # -- per-request selection ---------------------------------------------------------------
     def select_context(self, request_messages: List[Dict[str, Any]], **kwargs: Any) -> Optional[List[Dict[str, Any]]]:
-        goal = _goal_block(self._loom_session)
-        if not goal and not self.stack.frames:
-            return None  # nothing nested: leave the request byte-identical
-        if not request_messages or request_messages[0].get("role") != "system":
-            return None
-        first = dict(request_messages[0])
-        first["content"] = _append_to_content(first.get("content"), self.stack.render(goal))
-        return [first] + list(request_messages[1:])
+        with self._loom_lock:
+            self._require_ready()
+            goal = _goal_block(self._loom_session, self._loom_home)
+            if not goal and not self.stack.frames:
+                return None
+            if not request_messages or request_messages[0].get("role") != "system":
+                raise ContextSelectionRejected("loom: required frames need a system message; request was not sent.")
+            first = dict(request_messages[0])
+            first["content"] = _append_to_content(first.get("content"), self.stack.render(goal))
+            selected = [first] + list(request_messages[1:])
+            # New hosts validate the final wire request, after caps/overrides/middleware.
+            if not kwargs.get("request_validation"):
+                self._check_budget(selected, kwargs.get("tool_schemas"), kwargs.get("max_output_tokens"), kwargs.get("budget_tokens"))
+            return selected
+
+    def _check_budget(self, messages, tools, output, budget, model=None):
+        contract = self._loom_budget
+        keys = {"model", "tokenizer", "prompt_overhead", "message_overhead", "tool_overhead"}
+        if (not isinstance(contract, dict) or set(contract) != keys
+                or contract.get("tokenizer") != "utf8-byte-fallback"
+                or contract.get("model") != (self.model if model is None else model)
+                or any(type(contract.get(key)) is not int or contract[key] < 0
+                       for key in ("prompt_overhead", "message_overhead", "tool_overhead"))):
+            raise ContextSelectionRejected("loom: a reviewed model-specific byte-fallback/template budget contract is required; request was not sent.")
+        if type(budget) is not int or budget <= 0 or type(output) is not int or output <= 0 or not isinstance(tools, list):
+            raise ContextSelectionRejected("loom: context window, explicit output cap and tool schemas are required; request was not sent.")
+        for message in messages:
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                if not isinstance(content, list) or any(not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str) for part in content):
+                    raise ContextSelectionRejected("loom: this content type has no supported budget; request was not sent.")
+        # Intentionally conservative text budget, not a provider-exact tokenizer.
+        # UTF-8 bytes upper-bound ordinary byte-fallback tokens; reserve framing separately.
+        try:
+            charge = len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False).encode("utf-8"))
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise ContextSelectionRejected("loom: request cannot be safely budgeted.") from exc
+        charge += contract["prompt_overhead"] + contract["message_overhead"] * len(messages) + contract["tool_overhead"] * len(tools)
+        if charge + output > budget:
+            raise ContextSelectionRejected("loom: required context plus output exceeds the conservative context budget; shorten frames/history explicitly or select a larger window.")
+
+    def validate_request(self, request, *, budget_tokens=0, **kwargs):
+        with self._loom_lock:
+            self._require_ready()
+            goal = _goal_block(self._loom_session, self._loom_home)
+            if not goal and not self.stack.frames:
+                return
+            if kwargs.get("relay_enabled"):
+                raise ContextSelectionRejected("loom: Relay may rewrite requests after validation and is unsupported by this budget contract; request was not sent.")
+            if kwargs.get("api_mode") != "chat_completions" or not isinstance(request.get("messages"), list):
+                raise ContextSelectionRejected("loom: final budget validation supports text chat completions only; request was not sent.")
+            if request.get("extra_body"):
+                raise ContextSelectionRejected("loom: opaque request overrides cannot be safely budgeted; request was not sent.")
+            caps = [request[k] for k in ("max_tokens", "max_completion_tokens") if k in request]
+            if len(caps) != 1:
+                raise ContextSelectionRejected("loom: exactly one explicit output cap is required; request was not sent.")
+            # A middleware must not silently remove or rewrite the required block.
+            block = self.stack.render(goal)
+            content = request["messages"][0].get("content") if request["messages"] else None
+            texts = [content] if isinstance(content, str) else [p.get("text", "") for p in (content or []) if isinstance(p, dict)] if isinstance(content, list) else []
+            if not request["messages"] or request["messages"][0].get("role") != "system" or not any(block in text for text in texts):
+                raise ContextSelectionRejected("loom: required frames changed during request assembly; request was not sent.")
+            self._check_budget(request["messages"], request.get("tools", []), caps[0], budget_tokens, request.get("model"))
 
     # -- tool --------------------------------------------------------------------------------
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -255,28 +355,27 @@ class LoomEngine(ContextCompressor):
         if name != TOOL_NAME:
             return super().handle_tool_call(name, args, **kwargs)
         args = args or {}
-        action = str(args.get("action") or "").strip().lower()
-        try:
-            if action == "push":
-                self.stack.push(args.get("text"), args.get("label"))
-            elif action == "pop":
-                self.stack.pop(int(args.get("count") or 1))
-            elif action != "show":
-                raise ValueError(f"unknown action {action!r}; use push, pop or show")
-        except (ValueError, TypeError) as exc:
-            return json.dumps({"error": str(exc), "depth": len(self.stack.frames), "frames": self.stack.outline()})
-        if action != "show":
-            self._save()
-        return json.dumps({"ok": True, "depth": len(self.stack.frames), "frames": self.stack.outline()})
+        action = args.get("action")
+        with self._loom_lock:
+            try:
+                self._require_ready()
+                candidate = LoomStack.from_dict(self.stack.to_dict())
+                if action == "push":
+                    candidate.push(args.get("text"), args.get("label"))
+                elif action == "pop":
+                    candidate.pop(args.get("count", 1))
+                elif action != "show":
+                    raise ValueError("use push, pop or show")
+                if action != "show":
+                    self._commit(candidate)
+            except (ValueError, TypeError) as exc:
+                return json.dumps({"error": str(exc)})
+            return json.dumps({"ok": True, "depth": len(self.stack.frames), "frames": self.stack.outline()})
 
 
 def _loom_command(raw_args: str = "") -> str:
-    engine = _ACTIVE
-    if engine is None:
-        return "loom: no active session (set context.engine: loom in config.yaml)"
-    goal = _goal_block(engine._loom_session)
-    head = "goal: " + (goal.split("\n", 1)[0] if goal else "(none)")
-    return head + "\n" + engine.stack.outline()
+    # Hermes slash callbacks carry only raw_args, never a trustworthy agent/session.
+    return "loom: slash commands cannot identify the active session safely. Ask the agent to use the loom show tool."
 
 
 def register(ctx: Any) -> None:
@@ -290,4 +389,4 @@ def register(ctx: Any) -> None:
             return
     except Exception:
         pass
-    register_command("loom", _loom_command, description="Show the /goal frame stack kept at the front of context")
+    register_command("loom", _loom_command, description="Explain how to show the active agent’s frame stack safely")

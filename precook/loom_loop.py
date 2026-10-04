@@ -43,7 +43,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from loomframes import FORMAT as FRAMES_FORMAT, with_frames  # noqa: E402
+from loomframes import FORMAT as FRAMES_FORMAT, MAX_DEPTH, validate_frame, with_frames  # noqa: E402
 
 SCRIPT_FORMAT = "loom-script/1"
 DEFAULT_TASK = "Carry out the work of the innermost frame."
@@ -53,13 +53,19 @@ _IDENT = re.compile(r"[^A-Za-z0-9_]")
 class Node:
     __slots__ = ("label", "text", "task", "children")
 
-    def __init__(self, d):
-        if not isinstance(d, dict) or not str(d.get("text") or "").strip():
-            raise ValueError(f"outline node needs text: {d!r:.80}")
-        self.label = str(d.get("label") or "")
-        self.text = str(d["text"]).replace("\r\n", "\n").strip()
+    def __init__(self, d, depth=1):
+        if depth > MAX_DEPTH:
+            raise ValueError(f"outline exceeds {MAX_DEPTH} frames")
+        if not isinstance(d, dict):
+            raise ValueError("outline node must be an object")
+        frame = validate_frame({"text": d.get("text"), "label": d.get("label", "")})
+        self.label = frame["label"]
+        self.text = frame["text"].replace("\r\n", "\n").strip()
         self.task = str(d.get("task") or "").strip()
-        self.children = [Node(c) for c in (d.get("children") or [])]
+        children = d.get("children", [])
+        if not isinstance(children, list):
+            raise ValueError("children must be a list")
+        self.children = [Node(c, depth + 1) for c in children]
 
     @property
     def leaf(self):

@@ -5,6 +5,28 @@ loom_render_frames); change both together and bump FORMAT if the text changes, b
 cached prefix and every stored loom script depends on these exact bytes. Stdlib only.
 """
 
+import re
+
+MAX_TEXT = 4000
+MAX_DEPTH = 64
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+def validate_frame(frame):
+    """Validate without silently coercing, dropping or shortening required instructions."""
+    if not isinstance(frame, dict) or set(frame) - {"label", "text"}:
+        raise ValueError("frame must contain only label and text")
+    text, label = frame.get("text"), frame.get("label", "")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+        raise ValueError(f"frame text must contain 1-{MAX_TEXT} characters")
+    if not isinstance(label, str) or (label and not _LABEL.fullmatch(label)):
+        raise ValueError("frame label must use 1-64 letters, digits, underscore, dot or hyphen")
+    return {"label": label, "text": text}
+
+def validate_frames(frames):
+    if not isinstance(frames, list) or len(frames) > MAX_DEPTH:
+        raise ValueError(f"frames must be a list of at most {MAX_DEPTH} entries")
+    return [validate_frame(frame) for frame in frames]
+
 FORMAT = "loom-frames/1"
 OPEN = "[loom: nested work frames, outermost first; the last frame is the current loop]"
 CLOSE = "[/loom]"
@@ -16,6 +38,7 @@ def frame_name(depth, label):
 
 def render_frames(frames, goal=""):
     """frames: [{"label", "text"}], outermost first."""
+    frames = validate_frames(frames)
     parts = [OPEN]
     if goal:
         parts.append("== goal ==\n" + goal)
