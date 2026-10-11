@@ -6,10 +6,13 @@ of the system prompt after the /goal text. Each frame is an independent obstack 
 only its own text, nothing refers across frames, and a pop simply discards the top.
 
 That ordering is the nested-loop shape: outer frames change least often and sit furthest
-forward, the innermost frame changes most often and sits last, and the conversation (the loop
-body) follows. The next sibling iteration is a pop plus a push, so only the tail after the
-common frames moves. A prefix cache on the server (koboldcpp --loomcache, or any provider
-prompt cache) keeps everything before the change; nothing about frames or boundaries is sent.
+forward, and the conversation (the loop body) follows. The front moves only when the
+conversation behind it has already been rewritten (first request, reload, compaction, undo,
+pruning) or the goal changed. A push or pop does not move it: the loom tool call and result
+carry the change in the conversation, which only grows, and the next rewrite folds it into the
+front. So no prefix cache (koboldcpp --loomcache, Anthropic cache_control, OpenAI and Codex
+automatic prefix caching) loses the conversation to a frame change. Every vendor gets the same
+bytes; nothing about frames, caches or boundaries is sent, and cache signals stay the host's.
 
 Compaction is inherited unchanged from the built-in compressor; it only rewrites conversation
 turns, never the frames.
@@ -21,6 +24,7 @@ Provenance: see PROVENANCE.txt (origin jnorthrup/koboldcpp-loom@9c66f41e6, path 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -125,6 +129,36 @@ def _append_to_content(content: Any, text: str) -> Any:
     raise ContextSelectionRejected("loom: unsupported system content; required frames were not sent.")
 
 
+# Provider-visible message fields. One digest per message tells a conversation that only grew
+# (the front may stay) from one that was rewritten (compaction, undo, pruning: the cache is
+# already lost, so the front may catch up for free).
+_HISTORY_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "name")
+
+
+def _history_digests(messages: List[Any]) -> Optional[List[str]]:
+    try:
+        return [hashlib.sha256(json.dumps(
+                    {key: m.get(key) for key in _HISTORY_FIELDS} if isinstance(m, dict) else m,
+                    sort_keys=True, ensure_ascii=True, default=str).encode("ascii")).hexdigest()
+                for m in messages]
+    except (TypeError, ValueError, RecursionError):
+        return None  # cannot prove the conversation only grew: the front is re-rendered
+
+
+def _loom_calls(messages: List[Any]) -> int:
+    """Loom tool calls recorded in these messages: the conversation's own record of push/pop."""
+    count = 0
+    for message in messages:
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        for call in calls if isinstance(calls, list) else ():
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if (function.get("name") if isinstance(function, dict) else call.get("name")) == TOOL_NAME:
+                count += 1
+    return count
+
+
 def _compression_kwargs() -> Dict[str, Any]:
     """Mirror the user's ``compression`` config for the inherited compressor (plugin engines are
     constructed without it)."""
@@ -150,9 +184,11 @@ _TOOL_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
         "Nest work for the active /goal like nested loops. 'push' a frame when you enter a level of work "
-        "(its stable instructions, not findings); 'pop' when you leave it. Frames are shown to you at the "
-        "front of the context, outermost first, and the last frame is your current loop. Move to a sibling "
-        "with pop then push. Keep results and status in the conversation. "
+        "(its stable instructions, not findings); 'pop' when you leave it. Move to a sibling with pop then "
+        "push. A push or pop takes effect at once and its result lists the current stack, outermost first; "
+        "the last frame is your current loop. The front of the context shows the frames as of the last "
+        "context rebuild (start, reload, compaction), so prompt caches keep the conversation; where the "
+        "two differ, the latest loom result is current. Keep results and status in the conversation. "
         "Actions: push {text, label?}; pop {count?}; show."
     ),
     "parameters": {
@@ -188,6 +224,7 @@ class LoomEngine(ContextCompressor):
         self._loom_home = ""
         self._loom_error = ""
         self._loom_lock = RLock()
+        self._front: Optional[Dict[str, Any]] = None  # the block at the front of requests; see _front_block
         self._loom_init_kwargs = dict(kwargs, loom_budget=self._loom_budget)
 
     @property
@@ -228,6 +265,7 @@ class LoomEngine(ContextCompressor):
             old_error = self._loom_error
             # Clear first: even a failed load cannot expose the previous session.
             self.stack = LoomStack()
+            self._front = None
             self._loom_session = session_id if isinstance(session_id, str) else ""
             self._loom_home = ""
             self._loom_error = ""
@@ -263,6 +301,7 @@ class LoomEngine(ContextCompressor):
         with self._loom_lock:
             # Explicit reset may recover malformed state, but only an established identity.
             self._loom_error = ""
+            self._front = None
             self._commit(LoomStack())
             super().on_session_reset()
 
@@ -280,23 +319,51 @@ class LoomEngine(ContextCompressor):
             if self.stack.frames:
                 raise ContextSelectionRejected("loom: refusing to replace an initialized child frame stack.")
             self._commit(LoomStack.from_dict(data))
+            self._front = None
 
     # -- per-request selection ---------------------------------------------------------------
+    def _front_block(self, goal: str, history: List[Any]) -> str:
+        """The frame block for the front of this request.
+
+        Reused byte for byte while the conversation only grows, the goal is unchanged and every
+        push or pop since it was rendered has its loom tool call recorded in the conversation.
+        Re-rendered otherwise: first request, reload, compaction, undo, pruning, a goal change or
+        an unrecorded stack change. A recorded push or pop therefore never moves the front, and
+        an unprovable case costs one cache miss, never a frame."""
+        digests = _history_digests(history)
+        front = self._front
+        if (front is not None and digests is not None and front["seen"] is not None
+                and front["goal"] == goal
+                and digests[:len(front["seen"])] == front["seen"]
+                and _loom_calls(history[front["start"]:]) >= front["pending"]):
+            front["seen"] = digests
+            return front["block"]
+        block = self.stack.render(goal) if (goal or self.stack.frames) else ""
+        self._front = {"goal": goal, "block": block, "start": len(history), "seen": digests, "pending": 0}
+        return block
+
     def select_context(self, request_messages: List[Dict[str, Any]], **kwargs: Any) -> Optional[List[Dict[str, Any]]]:
         with self._loom_lock:
             self._require_ready()
             goal = _goal_block(self._loom_session, self._loom_home)
-            if not goal and not self.stack.frames:
+            history = kwargs.get("conversation_messages")
+            if not isinstance(history, list):
+                has_system = bool(request_messages) and request_messages[0].get("role") == "system"
+                history = request_messages[1:] if has_system else request_messages
+            block = self._front_block(goal, list(history))
+            if not block and not goal and not self.stack.frames:
                 return None
-            if not request_messages or request_messages[0].get("role") != "system":
-                raise ContextSelectionRejected("loom: required frames need a system message; request was not sent.")
-            first = dict(request_messages[0])
-            first["content"] = _append_to_content(first.get("content"), self.stack.render(goal))
-            selected = [first] + list(request_messages[1:])
+            selected = list(request_messages)
+            if block:
+                if not request_messages or request_messages[0].get("role") != "system":
+                    raise ContextSelectionRejected("loom: required frames need a system message; request was not sent.")
+                first = dict(request_messages[0])
+                first["content"] = _append_to_content(first.get("content"), block)
+                selected = [first] + list(request_messages[1:])
             # New hosts validate the final wire request, after caps/overrides/middleware.
             if not kwargs.get("request_validation"):
                 self._check_budget(selected, kwargs.get("tool_schemas"), kwargs.get("max_output_tokens"), kwargs.get("budget_tokens"))
-            return selected
+            return selected if block else None
 
     def _check_budget(self, messages, tools, output, budget, model=None):
         contract = self._loom_budget
@@ -328,7 +395,10 @@ class LoomEngine(ContextCompressor):
         with self._loom_lock:
             self._require_ready()
             goal = _goal_block(self._loom_session, self._loom_home)
-            if not goal and not self.stack.frames:
+            # The block select_context placed at the front; it may predate recorded pushes/pops.
+            block = (self._front["block"] if self._front is not None
+                     else self.stack.render(goal) if (goal or self.stack.frames) else "")
+            if not block and not goal and not self.stack.frames:
                 return
             if kwargs.get("relay_enabled"):
                 raise ContextSelectionRejected("loom: Relay may rewrite requests after validation and is unsupported by this budget contract; request was not sent.")
@@ -340,10 +410,9 @@ class LoomEngine(ContextCompressor):
             if len(caps) != 1:
                 raise ContextSelectionRejected("loom: exactly one explicit output cap is required; request was not sent.")
             # A middleware must not silently remove or rewrite the required block.
-            block = self.stack.render(goal)
             content = request["messages"][0].get("content") if request["messages"] else None
             texts = [content] if isinstance(content, str) else [p.get("text", "") for p in (content or []) if isinstance(p, dict)] if isinstance(content, list) else []
-            if not request["messages"] or request["messages"][0].get("role") != "system" or not any(block in text for text in texts):
+            if not request["messages"] or request["messages"][0].get("role") != "system" or (block and not any(block in text for text in texts)):
                 raise ContextSelectionRejected("loom: required frames changed during request assembly; request was not sent.")
             self._check_budget(request["messages"], request.get("tools", []), caps[0], budget_tokens, request.get("model"))
 
@@ -368,6 +437,8 @@ class LoomEngine(ContextCompressor):
                     raise ValueError("use push, pop or show")
                 if action != "show":
                     self._commit(candidate)
+                    if self._front is not None:
+                        self._front["pending"] += 1  # its tool call must reach the conversation
             except (ValueError, TypeError) as exc:
                 return json.dumps({"error": str(exc)})
             return json.dumps({"ok": True, "depth": len(self.stack.frames), "frames": self.stack.outline()})

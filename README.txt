@@ -6,19 +6,27 @@ What it does
   instructions); leaving it pops the frame. The frames on the stack, outermost first,
   sit at the front of every request after the /goal text:
 
-    system prompt | goal | frame 1 | frame 2 | ... | innermost frame | conversation
+    system prompt | goal | frame 1 | ... | innermost frame | conversation | push/pop calls
+                   '------- front, as of the last rebuild -------'           '-- since --'
 
   Each frame is an independent obstack frame: it holds only its own text and nothing
-  refers across frames. The next sibling iteration is pop + push, so only what follows
-  the shared enclosing frames changes. A prefix cache on the server (koboldcpp
-  --loomcache, or a provider prompt cache) keeps everything before the change. Nothing
-  about frames, depth or boundaries is sent to the server.
+  refers across frames. The front moves only when the conversation behind it has
+  already been rewritten (first request, reload, compaction, undo, pruning), the goal
+  changed, or a stack change is missing from the conversation. A push or pop is
+  carried by its own tool call and result, which only append; the next rewrite folds
+  it into the front. So a prefix cache (koboldcpp --loomcache, Anthropic
+  cache_control, OpenAI and Codex automatic prefix caching) keeps the frames and the
+  whole conversation across frame changes, and an unprovable case costs one cache
+  miss, never a frame. Every vendor gets the same bytes. Nothing about frames, depth
+  or boundaries is sent; provider cache signals stay the host's (Hermes
+  prompt_caching; `prompt_caching.cache_ttl: auto` keeps human-paced sessions on
+  Anthropic's 1h tier).
 
   Compaction is the built-in compressor, unchanged; it rewrites conversation turns only.
 
 Install
-  git clone git@github.com:jnorthrup/loom-hermes-plugin.git
-  ln -sfn "$PWD/loom-hermes-plugin" ~/.hermes/plugins/loom
+  git clone https://github.com/jnorthrup/loom-hermes-plugin.git
+  ln -sfn "$PWD/loom-hermes-plugin" "${HERMES_HOME:-$HOME/.hermes}/plugins/loom"
   # config.yaml
   context:
     engine: loom
@@ -135,3 +143,5 @@ Local verification
   Use the paired Hermes test interpreter and runner, with no runtime activation:
     HERMES_PYTHON=/path/to/hermes-agent/.venv/bin/python /path/to/hermes-agent/scripts/run_tests.sh /path/to/loom-hermes-plugin/tests --import-mode=importlib
   Tests use disposable profile homes and deny socket connections.
+  On a host without the paired seams, tests/run_unpaired.py supplies test-only stand-ins
+  (see its docstring): the 13 host-pair and 6 strict-goal tests fail there; the rest must pass.
