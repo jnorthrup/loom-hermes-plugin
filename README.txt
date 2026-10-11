@@ -43,7 +43,9 @@ Use
 
 State and host compatibility
   Requires the paired Hermes ContextSelectionRejected, validate_request and
-  inherit_from_parent hooks. Older hosts without typed refusal are unsupported.
+  inherit_from_parent hooks for its strict guarantees. Older hosts still run it:
+  a refusal fails open (the request goes out unframed), goal reads are not
+  strict, and the front stays within a tenth of the context window.
   No host or gateway is installed/restarted by these source changes.
 
   $HERMES_HOME/loom/session-<sha256 of exact session ID>.json carries the exact
@@ -144,4 +146,4 @@ Local verification
     HERMES_PYTHON=/path/to/hermes-agent/.venv/bin/python /path/to/hermes-agent/scripts/run_tests.sh /path/to/loom-hermes-plugin/tests --import-mode=importlib
   Tests use disposable profile homes and deny socket connections.
   On a host without the paired seams, tests/run_unpaired.py supplies test-only stand-ins
-  (see its docstring): the 13 host-pair and 6 strict-goal tests fail there; the rest must pass.
+  (see its docstring): 12 host-pair and 6 strict-goal tests fail there; the rest must pass.

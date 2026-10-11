@@ -34,7 +34,13 @@ from threading import RLock
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor import ContextCompressor
-from agent.context_engine import ContextSelectionRejected, ContextEngine  # noqa: F401  (discovery scans the file head for this name)
+from agent.context_engine import ContextEngine  # noqa: F401  (discovery scans the file head for this name)
+
+try:  # Paired hosts type refusals. Older hosts lack the type and fail open: a refused request goes out unframed.
+    from agent.context_engine import ContextSelectionRejected
+except ImportError:  # depends on the host
+    class ContextSelectionRejected(ValueError):
+        """Refusal on a host without the paired seam. A ValueError, so the loom tool reports it."""
 
 from .loomframes import MAX_DEPTH, render_frames, validate_frame, validate_frames
 from . import loomstate
@@ -104,18 +110,26 @@ def _goal_block(session_id: str, home: str) -> str:
         return ""
     try:
         from hermes_cli.goals import load_goal
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        token = set_hermes_home_override(home)
         try:
-            state = load_goal(session_id, strict=True)
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        except ImportError:  # unpaired host: the agent's own home is the session's home
+            set_hermes_home_override = reset_hermes_home_override = None
+        token = set_hermes_home_override(home) if set_hermes_home_override else None
+        try:
+            try:
+                state = load_goal(session_id, strict=True)
+            except TypeError:  # unpaired host: no strict read; an unreadable goal reads as none
+                state = load_goal(session_id)
         finally:
-            reset_hermes_home_override(token)
+            if reset_hermes_home_override:
+                reset_hermes_home_override(token)
     except Exception as exc:
         raise ContextSelectionRejected("loom: required goal state could not be read safely; request was not sent.") from exc
     if state is None or state.status == "cleared" or not (state.goal or "").strip():
         return ""
     block = _clean_text(state.goal)
-    subgoals = state.render_subgoals_block()
+    render = getattr(state, "render_subgoals_block", None)
+    subgoals = render() if callable(render) else ""
     return block + ("\n" + subgoals if subgoals else "")
 
 
@@ -180,6 +194,16 @@ def _compression_kwargs() -> Dict[str, Any]:
     return out
 
 
+def _check_front_share(block: str, budget: Any) -> None:
+    """Hosts without the paired seam pass only the context window and size the request themselves,
+    compaction included. Keep the front within a tenth of that window, counted in UTF-8 bytes (an
+    upper bound on tokens)."""
+    if type(budget) is not int or budget <= 0:
+        raise ContextSelectionRejected("loom: the host reported no context window; frames were not sent.")
+    if len(block.encode("utf-8")) > budget // 10:
+        raise ContextSelectionRejected("loom: the frames exceed a tenth of the context window; pop or shorten frames.")
+
+
 _TOOL_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
@@ -189,7 +213,7 @@ _TOOL_SCHEMA = {
         "the last frame is your current loop. The front of the context shows the frames as of the last "
         "context rebuild (start, reload, compaction), so prompt caches keep the conversation; where the "
         "two differ, the latest loom result is current. Keep results and status in the conversation. "
-        "Actions: push {text, label?}; pop {count?}; show."
+        "Actions: push {text, label?}; pop {count?}; show. Call this tool by its exact name, loom, with no prefix."
     ),
     "parameters": {
         "type": "object",
@@ -361,7 +385,11 @@ class LoomEngine(ContextCompressor):
                 first["content"] = _append_to_content(first.get("content"), block)
                 selected = [first] + list(request_messages[1:])
             # New hosts validate the final wire request, after caps/overrides/middleware.
-            if not kwargs.get("request_validation"):
+            if kwargs.get("request_validation"):
+                pass
+            elif kwargs.get("max_output_tokens") is None and kwargs.get("tool_schemas") is None:
+                _check_front_share(block, kwargs.get("budget_tokens"))  # unpaired host: it sizes the request
+            else:
                 self._check_budget(selected, kwargs.get("tool_schemas"), kwargs.get("max_output_tokens"), kwargs.get("budget_tokens"))
             return selected if block else None
 
@@ -449,7 +477,29 @@ def _loom_command(raw_args: str = "") -> str:
     return "loom: slash commands cannot identify the active session safely. Ask the agent to use the loom show tool."
 
 
+def _install_oauth_name_fallback() -> None:
+    """Hermes' Anthropic OAuth wire renames every tool ``mcp__<name>`` and maps replies back only
+    through the tool registry, which does not hold context-engine tools, so ``mcp__loom`` never
+    reached this engine. Map exactly that name back to ``loom``; every other name keeps the host's
+    mapping, and a host that resolves engine tools itself passes through unchanged."""
+    try:
+        import agent.transports.anthropic as transport
+    except Exception:
+        return
+    original = getattr(transport, "_unprefix_oauth_tool_name", None)
+    if not callable(original) or getattr(original, "_loom_fallback", False):
+        return
+
+    def unprefix(name: str) -> str:
+        resolved = original(name)
+        return TOOL_NAME if resolved == "mcp__" + TOOL_NAME else resolved
+
+    unprefix._loom_fallback = True  # type: ignore[attr-defined]
+    transport._unprefix_oauth_tool_name = unprefix
+
+
 def register(ctx: Any) -> None:
+    _install_oauth_name_fallback()
     ctx.register_context_engine(LoomEngine())
     register_command = getattr(ctx, "register_command", None)
     if not callable(register_command):
