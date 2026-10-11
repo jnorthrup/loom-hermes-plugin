@@ -38,8 +38,10 @@ Use
     push {text, label?}   enter a level: its stable instructions, not findings
     pop  {count?}         leave one or more levels
     show                  print the frames
-  /loom explains how to use the agent-bound show tool. Hermes slash handlers receive
-  only raw arguments; they cannot safely identify a session and never display frames.
+  /loom prints the frames in the interactive CLI, which holds one conversation per process:
+  it reads only that CLI agent's own engine, and only while the engine is bound to the
+  agent's session. Hermes passes slash handlers nothing but raw arguments, so in the TUI and
+  gateways, which serve many sessions per process, /loom refuses and points to the show tool.
 
 State and host compatibility
   Requires the paired Hermes ContextSelectionRejected, validate_request and
@@ -147,3 +149,9 @@ Local verification
   Tests use disposable profile homes and deny socket connections.
   On a host without the paired seams, tests/run_unpaired.py supplies test-only stand-ins
   (see its docstring): 12 host-pair and 6 strict-goal tests fail there; the rest must pass.
+  tests/pytest.ini makes tests/ the pytest rootdir, so the suite collects under any checkout
+  name (a root named loom-hermes-plugin is not an importable package).
+
+License and home
+  MIT (LICENSE), copyright Jim Northrup. This repository is the plugin's home:
+  changes land here first, and integrations pin a commit from it.

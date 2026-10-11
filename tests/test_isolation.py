@@ -31,6 +31,62 @@ def test_session_reuse_starts_empty_and_slash_cannot_disclose(loom, tmp_path):
     assert e.stack.frames == [{"label": "", "text": "private A"}]
 
 
+def test_slash_shows_only_the_cli_agents_own_bound_session(loom, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.plugins import get_plugin_manager
+    e = engine(loom, tmp_path)
+    push(e, "private A")
+    manager = get_plugin_manager()
+    monkeypatch.setattr(manager, "_cli_ref", None, raising=False)  # TUI and gateways
+    assert "cannot identify" in loom._loom_command()
+    agent = SimpleNamespace(session_id="a", context_compressor=e)
+    monkeypatch.setattr(manager, "_cli_ref", SimpleNamespace(agent=agent))
+    assert "private A" in loom._loom_command()
+    agent.session_id = "b"  # the CLI moved on before its engine did
+    assert "private A" not in loom._loom_command()
+    e.on_session_start("b", hermes_home=str(tmp_path))
+    assert loom._loom_command() == "(no frames)"
+    agent.session_id = ""
+    assert "no frame stack" in loom._loom_command()
+    agent.session_id, agent.context_compressor = "b", object()  # another engine is active
+    assert "no frame stack" in loom._loom_command()
+    monkeypatch.setattr(manager, "_cli_ref", SimpleNamespace(agent=None))  # before the first turn
+    assert "no frame stack" in loom._loom_command()
+
+
+def test_slash_reads_only_the_session_the_host_binds(loom, tmp_path, monkeypatch):
+    import contextvars
+    from gateway import session_context
+    from hermes_cli.plugins import get_plugin_manager
+    monkeypatch.setattr(get_plugin_manager(), "_cli_ref", None, raising=False)
+    monkeypatch.setattr(session_context, "_session_context_engaged", session_context._session_context_engaged)
+    a, b = engine(loom, tmp_path / "one", "a"), engine(loom, tmp_path / "two", "b")
+    push(a, "private A")
+    push(b, "private B")
+
+    def run(**bound):  # one TUI request: a fresh context, bound and cleared like _run_plugin_command
+        def call():
+            tokens = session_context.set_session_vars(**bound) if bound else []
+            try:
+                return loom._loom_command()
+            finally:
+                if tokens:
+                    session_context.clear_session_vars(tokens)
+        return contextvars.Context().run(call)
+
+    out = run(session_key="tui:1", session_id="a")
+    assert "private A" in out and "private B" not in out
+    assert "private B" in run(session_key="tui:2", session_id="b")
+    assert "cannot identify" in run(session_key="agent:main:telegram:dm:1")  # messaging gateway: no id
+    assert "cannot identify" in run(session_id="a")  # an id without a key is not this command's binding
+    monkeypatch.setenv("HERMES_SESSION_ID", "a")  # os.environ names whichever agent started last
+    assert "cannot identify" in run()
+    assert "no frame stack" in run(session_key="tui:3", session_id="c")
+    b.on_session_start("b2", hermes_home=str(tmp_path / "two"))
+    assert "no frame stack" in run(session_key="tui:2", session_id="b")
+    assert run(session_key="tui:2", session_id="b2") == "(no frames)"
+
+
 def test_collision_free_sessions_and_profiles_concurrently(loom, tmp_path):
     a = engine(loom, tmp_path / "one", "a/b")
     b = engine(loom, tmp_path / "one", "a_b")

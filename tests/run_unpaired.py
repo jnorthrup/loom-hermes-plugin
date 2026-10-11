@@ -4,8 +4,9 @@ Test-only stand-ins, installed before pytest imports anything:
   agent.context_engine.ContextSelectionRejected  a ValueError subclass (the tool handler reports
                                                  refusals through except (ValueError, TypeError))
   hermes_cli.goals.load_goal(strict=...)         accepted and ignored
-The 13 host-pair tests and the 6 strict-goal tests need the real paired host and fail here; every
-other test must pass. Nothing here makes the plugin usable on such a host.
+The 12 host-pair tests and the 6 strict-goal tests need the real paired host and fail here; every
+other test must pass. The stand-ins exist only so the tests import; the plugin carries its own
+fallbacks for such a host (README.txt).
 
   cd loom-hermes-plugin
   HERMES_DISABLE_LAZY_INSTALLS=1 HERMES_HOME="$(mktemp -d)" PYTHONDONTWRITEBYTECODE=1 \\

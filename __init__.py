@@ -24,13 +24,15 @@ Provenance: see PROVENANCE.txt (origin jnorthrup/koboldcpp-loom@9c66f41e6, path 
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
 import os
 import re
+import weakref
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor import ContextCompressor
@@ -228,6 +230,12 @@ _TOOL_SCHEMA = {
 }
 
 
+# Engines by the exact session they are bound to, read only by /loom. Weak, so it never keeps a
+# finished agent alive; a hit counts only while that engine is still bound to that session.
+_LIVE_ENGINES: "weakref.WeakValueDictionary[str, LoomEngine]" = weakref.WeakValueDictionary()
+_LIVE_LOCK = Lock()
+
+
 class LoomEngine(ContextCompressor):
     """ContextCompressor plus a front-of-context /goal frame stack."""
 
@@ -293,6 +301,11 @@ class LoomEngine(ContextCompressor):
             self._loom_session = session_id if isinstance(session_id, str) else ""
             self._loom_home = ""
             self._loom_error = ""
+            with _LIVE_LOCK:
+                if old_session and _LIVE_ENGINES.get(old_session) is self:
+                    del _LIVE_ENGINES[old_session]
+                if self._loom_session:
+                    _LIVE_ENGINES[self._loom_session] = self
             try:
                 home = kwargs.get("hermes_home") or (old_home if kwargs.get("boundary_reason") == "compression" else None)
                 if not home:
@@ -472,9 +485,56 @@ class LoomEngine(ContextCompressor):
             return json.dumps({"ok": True, "depth": len(self.stack.frames), "frames": self.stack.outline()})
 
 
+_SLASH_REFUSAL = "loom: slash commands cannot identify the active session safely. Ask the agent to use the loom show tool."
+_SLASH_NO_STACK = "loom: no frame stack is loaded for this session."
+
+
+def _host_bound(name: str) -> str:
+    """A HERMES_SESSION_* value the host bound in this context, else "". Never os.environ: every
+    agent init writes HERMES_SESSION_ID there, so in a process serving many sessions it names
+    whichever agent started last."""
+    for var, value in contextvars.copy_context().items():
+        if var.name == name and isinstance(value, str):
+            return value
+    return ""
+
+
+def _slash_target() -> Optional[tuple]:
+    """(engine, session id) for the session that issued a slash command; None when unknown.
+
+    Hermes passes slash handlers only raw_args, so the session comes from the host's own seams:
+    the interactive CLI sets the plugin manager's _cli_ref there alone (one conversation per
+    process, and its agent owns its engine); the TUI binds the HERMES_SESSION_* context of the
+    session it serves around the handler. That binding always carries the session key; an id
+    without one is a leftover of an agent build, not a binding for this command. The messaging
+    gateway binds no session id, so there, as anywhere else, this is None.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        cli = get_plugin_manager()._cli_ref
+    except Exception:
+        cli = None
+    if cli is not None:
+        agent = getattr(cli, "agent", None)
+        return getattr(agent, "context_compressor", None), getattr(agent, "session_id", None)
+    session_id = _host_bound("HERMES_SESSION_ID")
+    if not session_id or not _host_bound("HERMES_SESSION_KEY"):
+        return None
+    with _LIVE_LOCK:
+        return _LIVE_ENGINES.get(session_id), session_id
+
+
 def _loom_command(raw_args: str = "") -> str:
-    # Hermes slash callbacks carry only raw_args, never a trustworthy agent/session.
-    return "loom: slash commands cannot identify the active session safely. Ask the agent to use the loom show tool."
+    target = _slash_target()
+    if target is None:
+        return _SLASH_REFUSAL
+    engine, session_id = target
+    if not isinstance(engine, LoomEngine) or not isinstance(session_id, str) or not session_id:
+        return _SLASH_NO_STACK
+    with engine._loom_lock:
+        if engine._loom_session != session_id:  # mid-rebind: never show another session's frames
+            return _SLASH_NO_STACK
+        return engine._loom_error or engine.stack.outline()
 
 
 def _install_oauth_name_fallback() -> None:
@@ -510,4 +570,4 @@ def register(ctx: Any) -> None:
             return
     except Exception:
         pass
-    register_command("loom", _loom_command, description="Explain how to show the active agent’s frame stack safely")
+    register_command("loom", _loom_command, description="Show this session's frame stack (interactive CLI)")

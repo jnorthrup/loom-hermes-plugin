@@ -21,6 +21,9 @@ Host it plugs into
     Hermes Agent v0.21.5+2367.g5dcfd72, upstream commit
     5dcfd72a968e17cc4dc262c46d918a6841a21722 (2026-09-25).
   It subclasses Hermes' built-in ContextCompressor, so compaction is Hermes' own code.
+  It also runs, without the strict guarantees, on Hermes
+  v0.21.6+canary.20261010T070026Z-142-g66605471e9f, which lacks the paired seams
+  (README.txt: State and host compatibility).
 
 Server it is tuned for
   koboldcpp --loomcache (prefix-tree branch cache), github.com/jnorthrup/koboldcpp-loom
@@ -32,3 +35,15 @@ Design rules it follows (from the author)
     leaving it, like nested for loops.
   - Frames are independent obstack frames; nothing interlocks.
   - No cache hints, tiers or fixed depth are sent; the server finds reuse from tokens.
+
+Changes brought back from downstream
+  The 0.2.0 front reuse and the unpaired-host fallbacks were written in a private downstream
+  integration repository and brought back on 2026-10-11, one commit each, with the source
+  commit's author date:
+    5be31d418ca6b5458def9b4c06daa64a88cbf4ae  the front moves only when the conversation is rewritten
+    e56b63998d759291534082c697a6ec8bb6e12486  runs on hosts without the paired seams
+  Code and tests are byte for byte; install and test-path text was rewritten for this
+  repository. Since then this repository is the plugin's home.
+
+License
+  MIT (LICENSE), chosen by the author on 2026-10-11.
